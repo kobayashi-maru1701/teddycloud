@@ -19,6 +19,7 @@
 
 void fsFixPath(char_t *path);
 FsFile *fsOpenFileEx(const char_t *path, char *mode);
+error_t fsFlushFile(FsFile *file);
 error_t fsCompareFiles(const char_t *source_path, const char_t *target_path, size_t *diff_position);
 error_t fsCopyFile(const char_t *source_path, const char_t *target_path, bool_t overwrite);
 /* Copies the bytes [offset, end) of the open file src to the current position of dst */
