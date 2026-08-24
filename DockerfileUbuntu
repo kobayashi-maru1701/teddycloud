@@ -1,4 +1,4 @@
-FROM ubuntu:latest AS buildenv
+FROM ubuntu:24.04 AS buildenv
 
 # Default to using ASAN
 ARG NO_SANITIZERS=0
