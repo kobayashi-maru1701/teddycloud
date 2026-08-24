@@ -41,7 +41,7 @@ permissions:
   packages: write
 
 env:
-  REGISTRY_IMAGE: ghcr.io/kobayashi-maru1701/teddycloud
+  REGISTRY_IMAGE: ghcr.io/toniebox-reverse-engineering/teddycloud
 
 jobs:
   build:
