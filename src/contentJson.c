@@ -169,6 +169,10 @@ error_t load_content_json(const char *content_path, contentJson_t *content_json,
 
 error_t save_content_json(const char *json_path, contentJson_t *content_json)
 {
+    /* Don't create file for FFFFFFFF */
+    if (osStrstr(json_path, "FFFFFFFF.json") != NULL) {
+        return ERROR_INVALID_PARAMETER;
+    }
     /* retrieve content directory */
     char *content_dir = strdup(json_path);
 
