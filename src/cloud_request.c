@@ -21,6 +21,7 @@
 #include "platform.h"         // for resolve_free, resolve_get_ip, resolve_...
 #include "rand.h"             // for rand_get_algo, rand_get_context
 #include "settings.h"         // for settings_t, get_settings, settings_cert_t
+#include "str_ext.h"          // for split_url
 #include "stdbool.h"          // for bool, true, false
 #include "tls.h"              // for TlsContext, _TlsContext (ptr only)
 #include "tls_adapter.h"      // for tls_context_key_log_init
@@ -395,13 +396,19 @@ error_t web_request(const char *server, int port, bool https, const char *uri, c
 
                     char uri_base[256], uri_path[256], query_string[256];
                     // TODO: handling of relative URLs
-                    split_url(location, uri_base, uri_path, query_string);
+                    if (!split_url(location, uri_base, uri_path, query_string, sizeof(uri_base)))
+                    {
+                        TRACE_ERROR("Failed to parse redirect Location: %s\r\n", location);
+                        error = ERROR_INVALID_RESPONSE;
+                        break;
+                    }
 
                     TRACE_DEBUG("URI Base: %s\r\n", uri_base);
                     TRACE_DEBUG("URI Path: %s\r\n", uri_path);
                     TRACE_DEBUG("Query String: %s\r\n", query_string);
 
-                    error = web_request(uri_base, 443, true, uri_path, query_string, "GET", NULL, 0, NULL, cbr, false, false, NULL);
+                    /* pass statusCode on, so the caller gets the status of the final response, not the 302 */
+                    error = web_request(uri_base, 443, true, uri_path, query_string, "GET", NULL, 0, NULL, cbr, false, false, statusCode);
                     break;
                 }
             }
@@ -528,50 +535,4 @@ error_t web_request(const char *server, int port, bool https, const char *uri, c
     httpClientDeinit(&httpClientContext);
 
     return error;
-}
-
-void split_url(const char *location, char *uri_base, char *uri_path, char *query_string)
-{
-    const char *scheme_end = strstr(location, "://");
-    if (!scheme_end)
-    {
-        TRACE_ERROR("Invalid URL: Scheme not found\n");
-        return;
-    }
-    // Move pointer to start after "://"
-    scheme_end += 3;
-
-    const char *path_start = strchr(scheme_end, '/');
-    if (!path_start)
-    {
-        TRACE_ERROR("Invalid URL: Path not found\n");
-        return;
-    }
-    const char *query_start = strchr(path_start, '?');
-
-    if (query_start)
-    {
-        // Copy base URI without scheme
-        strncpy(uri_base, scheme_end, path_start - scheme_end);
-        uri_base[path_start - scheme_end] = '\0';
-
-        // Copy path
-        strncpy(uri_path, path_start, query_start - path_start);
-        uri_path[query_start - path_start] = '\0';
-
-        // Copy query string
-        strcpy(query_string, query_start + 1);
-    }
-    else
-    {
-        // Copy base URI without scheme
-        strncpy(uri_base, scheme_end, path_start - scheme_end);
-        uri_base[path_start - scheme_end] = '\0';
-
-        // Copy path
-        strcpy(uri_path, path_start);
-
-        // No query string
-        query_string[0] = '\0';
-    }
 }

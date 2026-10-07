@@ -3,6 +3,7 @@
 #include <time.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "version.h"
 #include "debug.h"
@@ -42,6 +43,22 @@ static char *settings_sanitize_box_id(const char *input_id);
 #define OVERLAY_CONFIG_PREFIX "overlay."
 static settings_t Settings_Overlay[MAX_OVERLAYS];
 static setting_item_t *Option_Map_Overlay[MAX_OVERLAYS];
+/* name-sorted index into Option_Map_Overlay for O(log n) lookups by name;
+   rebuilt whenever the option map is (re)built, freed in settings_deinit_ovl */
+static setting_item_t **Option_Sorted_Overlay[MAX_OVERLAYS];
+
+static int settings_option_name_qsort_cmp(const void *a, const void *b)
+{
+    const setting_item_t *x = *(setting_item_t *const *)a;
+    const setting_item_t *y = *(setting_item_t *const *)b;
+    return osStrcmp(x->option_name, y->option_name);
+}
+
+static int settings_option_name_bsearch_cmp(const void *key, const void *elem)
+{
+    const setting_item_t *opt = *(setting_item_t *const *)elem;
+    return osStrcmp((const char *)key, opt->option_name);
+}
 static uint16_t settings_size = 0;
 static char *config_file_path = NULL;
 static char *config_overlay_file_path = NULL;
@@ -85,8 +102,6 @@ static void option_map_init(uint8_t settingsId)
     OPTION_STRING("core.sslkeylogfile", &settings->core.sslkeylogfile, "", "SSL-key logfile", "SSL/TLS key log filename", LEVEL_EXPERT)
     OPTION_UNSIGNED("core.server.http_client_timeout", &settings->core.http_client_timeout, 2000, 250, 10000, "Connection timeout", "HTTP client connection timeout (default: 500ms)", LEVEL_DETAIL)
     OPTION_UNSIGNED("core.file_upload_timeout_ms", &settings->core.file_upload_timeout_ms, 120000, 15000, 300000, "File upload timeout", "Client-side timeout for file uploads in ms (15s–5min). Default 120s for large audio files.", LEVEL_DETAIL)
-    OPTION_BOOL("core.new_webgui_as_default", &settings->core.new_webgui_as_default, TRUE, "New WebGUI", "Use new WebGUI as default", LEVEL_EXPERT)
-
     OPTION_TREE_DESC("core.server_cert", "HTTPS server certificates", LEVEL_EXPERT)
     OPTION_TREE_DESC("core.client_cert.file", "File certificates", LEVEL_EXPERT)
     OPTION_STRING("core.server_cert.file.ca", &settings->core.server_cert.file.ca, "certs/server/ca-root.pem", "CA certificate", "CA certificate", LEVEL_EXPERT)
@@ -281,6 +296,7 @@ static void option_map_init(uint8_t settingsId)
     OPTION_BOOL("cloud.prioCustomContent", &settings->cloud.prioCustomContent, TRUE, "Prioritize custom content", "Prioritize custom content over tonies content (force update, only if \"Update content on lower audio id\" is disabled)", LEVEL_EXPERT)
     OPTION_BOOL("cloud.updateOnLowerAudioId", &settings->cloud.updateOnLowerAudioId, TRUE, "Update content on lower audio id", "Update content on a lower audio id", LEVEL_EXPERT)
     OPTION_BOOL("cloud.dumpRuidAuthContentJson", &settings->cloud.dumpRuidAuthContentJson, TRUE, "Dump rUID/auth", "Dump the rUID and authentication into the content JSON.", LEVEL_EXPERT)
+    OPTION_BOOL("cloud.autoMarkListenedOnSync", &settings->cloud.autoMarkListenedOnSync, TRUE, "Auto-mark listened on sync", "Automatically mark library content as listened once a Toniebox downloads/plays it from this server", LEVEL_BASIC)
 
     OPTION_TREE_DESC("encode", "TAF encoding", LEVEL_EXPERT)
     OPTION_UNSIGNED("encode.bitrate", &settings->encode.bitrate, 96, 0, 256, "Opus bitrate", "Opus bitrate, tested 64, 96(default), 128, 192, 256 - be aware that this increases the TAF size!", LEVEL_EXPERT)
@@ -296,6 +312,7 @@ static void option_map_init(uint8_t settingsId)
     OPTION_BOOL("frontend.ignore_web_version_mismatch", &settings->frontend.ignore_web_version_mismatch, FALSE, "Ignore web version mismatch", "Ignore web version mismatch and don't show the mismatch warning", LEVEL_EXPERT)
     OPTION_BOOL("frontend.confirm_audioplayer_close", &settings->frontend.confirm_audioplayer_close, TRUE, "Confirm audioplayer close", "Confirm dialog when closing the audioplayer during active playback", LEVEL_BASIC)
     OPTION_BOOL("frontend.check_cc3200_cfw", &settings->frontend.check_cc3200_cfw, FALSE, "Check for CFW on CC3200 box", "Enable detection of CFW on CC3200 boxes to link MAC addresses to IPs.", LEVEL_DETAIL)
+    OPTION_BOOL("frontend.web_auth_enabled", &settings->frontend.web_auth_enabled, FALSE, "Web UI login", "Require a login for the web interface. Manage users in the web UI. Disabled by default. Set TEDDYCLOUD_WEB_AUTH_DISABLE=1 to bypass.", LEVEL_BASIC)
 
     OPTION_TREE_DESC("toniebox", "Toniebox", LEVEL_BASIC)
     OPTION_BOOL("toniebox.api_access", &settings->toniebox.api_access, TRUE, "API access", "Grant access to the API (default value for new boxes)", LEVEL_EXPERT)
@@ -367,6 +384,22 @@ static void option_map_init(uint8_t settingsId)
     }
 
     osMemcpy(Option_Map_Overlay[settingsId], option_map_array, sizeof(option_map_array));
+
+    /* (Re)build the name-sorted lookup index. Leaves Option_Map_Overlay in its
+       original declaration order (the web UI relies on it); only this parallel
+       pointer array is sorted. */
+    if (Option_Sorted_Overlay[settingsId] == NULL)
+    {
+        Option_Sorted_Overlay[settingsId] = osAllocMem(sizeof(setting_item_t *) * settings_size);
+    }
+    if (Option_Sorted_Overlay[settingsId] != NULL)
+    {
+        for (uint16_t idx = 0; idx < settings_size; idx++)
+        {
+            Option_Sorted_Overlay[settingsId][idx] = &Option_Map_Overlay[settingsId][idx];
+        }
+        qsort(Option_Sorted_Overlay[settingsId], settings_size, sizeof(setting_item_t *), settings_option_name_qsort_cmp);
+    }
 }
 
 static setting_item_t *get_option_map(const char *overlay)
@@ -700,6 +733,9 @@ static void settings_deinit_ovl(uint8_t overlayNumber)
 
     osFreeMem(Option_Map_Overlay[overlayNumber]);
     Option_Map_Overlay[overlayNumber] = NULL;
+
+    osFreeMem(Option_Sorted_Overlay[overlayNumber]);
+    Option_Sorted_Overlay[overlayNumber] = NULL;
 }
 
 void settings_deinit()
@@ -1235,6 +1271,20 @@ static setting_item_t *settings_get_by_name_id(const char *item, uint8_t setting
         TRACE_ERROR("Overlay %d not found\r\n", settingsId);
         return NULL;
     }
+    /* Fast path: binary search the name-sorted index built in option_map_init. */
+    setting_item_t **sorted = Option_Sorted_Overlay[settingsId];
+    if (sorted != NULL)
+    {
+        setting_item_t **found = bsearch(item, sorted, settings_size, sizeof(setting_item_t *), settings_option_name_bsearch_cmp);
+        if (found != NULL)
+        {
+            return *found;
+        }
+        TRACE_WARNING("Setting item '%s' not found\r\n", item);
+        return NULL;
+    }
+
+    /* Fallback: linear scan if the sorted index is unavailable. */
     while (option_map[pos].type != TYPE_END)
     {
         if (!strcmp(item, option_map[pos].option_name))
