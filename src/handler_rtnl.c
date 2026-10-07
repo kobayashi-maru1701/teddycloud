@@ -125,6 +125,9 @@ static char *rtnl_field6_strdup(const TonieRtnlLog2 *log2, size_t offset)
     }
     out[len] = '\0';
     return out;
+{
+    // RTNL transmits the low word first. Widen without sign-extending bit 31.
+    return (uint32_t)read_big_endian32(buf) | ((uint64_t)(uint32_t)read_big_endian32(&buf[4]) << 32);
 }
 
 static char *absolute_url(const char *url_or_path)
