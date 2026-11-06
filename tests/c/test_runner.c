@@ -22,6 +22,13 @@ static const test_case_t tests[] = {
     {"hex_encode", test_hex_encode},
     {"escape_string", test_escape_string},
     {"split_url", test_split_url},
+    {"ipv4_is_public", test_ipv4_is_public},
+    {"esp32_port_patch", test_esp32_port_patch},
+    {"socket_receive_line_from_full_buffer", test_socket_receive_line_from_full_buffer},
+    {"socket_receive_line_capped_at_size", test_socket_receive_line_capped_at_size},
+    {"box_cert_id", test_box_cert_id},
+    {"box_cert_issuer_known", test_box_cert_issuer_known},
+    {"zip_write_stored", test_zip_write_stored},
 };
 
 int main(void)

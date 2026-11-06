@@ -4,6 +4,11 @@
 # answer on the HTTP port, runs the given command, and always stops the
 # server afterwards - regardless of whether the command succeeds.
 #
+# The server runs in a sandbox: a copy of a template base directory (--base_path),
+# so tests never touch the dev config/data/certs. The sandbox path is exported
+# as TC_SANDBOX and removed afterwards. Ports given as 0 are picked free; the
+# ports and TEDDYCLOUD_BASE_URL are exported to the command.
+#
 # Usage:
 #   with_server.sh <http_port> <https_web_port> <https_api_port> <ready_timeout_seconds> -- <command...>
 #
@@ -28,6 +33,21 @@ shift
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="$REPO_ROOT/bin/teddycloud"
 
+# a port of 0 means: pick a free one (so tests don't collide with whatever runs on the dev machine)
+free_port() {
+    python3 -c '
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+'
+}
+[ "$HTTP_PORT" != 0 ] || HTTP_PORT="$(free_port)"
+[ "$HTTPS_WEB_PORT" != 0 ] || HTTPS_WEB_PORT="$(free_port)"
+[ "$HTTPS_API_PORT" != 0 ] || HTTPS_API_PORT="$(free_port)"
+export TC_HTTP_PORT="$HTTP_PORT" TC_HTTPS_WEB_PORT="$HTTPS_WEB_PORT" TC_HTTPS_API_PORT="$HTTPS_API_PORT"
+export TEDDYCLOUD_BASE_URL="http://127.0.0.1:$HTTP_PORT" TEDDYCLOUD_HTTPS_API_PORT="$HTTPS_API_PORT"
+
 for port in "$HTTP_PORT" "$HTTPS_WEB_PORT" "$HTTPS_API_PORT"; do
     if ! python3 -c '
 import socket, sys
@@ -43,50 +63,99 @@ sys.exit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1]))) else 1)
 done
 
 tmp_log="$(mktemp /tmp/teddycloud_test_XXXXXX.log)"
+# no tonies.json download from the internet, tests must not depend on the network
+PORT_SETTINGS="core.tonies_json_auto_update=false,core.server.http_port=$HTTP_PORT,core.server.https_web_port=$HTTPS_WEB_PORT,core.server.https_api_port=$HTTPS_API_PORT"
 
-# --config-set persists to config/, and tests may create users; snapshot what
-# they touch and restore it on exit so a test run leaves the dev config alone.
-CONFIG_DIR="$REPO_ROOT/config"
-BACKUP_FILES=(config.ini web_users.json)
-backup_dir="$(mktemp -d /tmp/teddycloud_test_cfg_XXXXXX)"
-for f in "${BACKUP_FILES[@]}"; do
-    if [ -e "$CONFIG_DIR/$f" ]; then cp -p "$CONFIG_DIR/$f" "$backup_dir/$f"; else touch "$backup_dir/$f.absent"; fi
-done
-"$BIN" --config-set "core.server.http_port=$HTTP_PORT,core.server.https_web_port=$HTTPS_WEB_PORT,core.server.https_api_port=$HTTPS_API_PORT" \
-    >"$tmp_log" 2>&1 &
-srv_pid=$!
+# Generating the server certificates takes minutes, hence the template is
+# created once and reused. It is regenerated when the certificate code changes
+# (stamp in .complete), or delete the directory. CI caches it with the same key.
+TEMPLATE="${TC_TEST_TEMPLATE:-$REPO_ROOT/bin/test-template}"
+WEB_UI="$REPO_ROOT/data/www/web"
+# bump the layout number when the template directory structure below changes
+TEMPLATE_LAYOUT=4
+TEMPLATE_STAMP="$( (echo "$TEMPLATE_LAYOUT"; cat "$REPO_ROOT/src/cert.c" "$REPO_ROOT/include/cert.h") | sha256sum | cut -d' ' -f1)"
+srv_pid=
+LINEBUF=; command -v stdbuf >/dev/null && LINEBUF="stdbuf -oL -eL" # the log is otherwise lost when the server is killed
+SANDBOX=
+
+wait_ready() { # <pid> <timeout_seconds> [any]  (any: every HTTP answer counts, not only 200)
+    local deadline=$(($(date +%s) + $2)) code
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        kill -0 "$1" >/dev/null 2>&1 || return 1
+        code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP_PORT/web/" || true)
+        [ "$code" = "200" ] && return 0
+        [ "${3:-}" = any ] && [ "$code" != "000" ] && return 0
+        sleep 0.2
+    done
+    return 1
+}
+
+start_server() { # <base dir>
+    (cd "$1" && exec $LINEBUF "$BIN" --base_path "$1" --config-set "$PORT_SETTINGS") >"$tmp_log" 2>&1 &
+    srv_pid=$!
+}
+
+stop_server() {
+    if [ -n "$srv_pid" ]; then
+        kill "$srv_pid" >/dev/null 2>&1 || true
+        wait "$srv_pid" 2>/dev/null || true # the server may write config on shutdown
+        srv_pid=
+    fi
+}
+
+fail_log() {
+    echo "[ERR] $1. Log:" >&2
+    sed -n '1,140p' "$tmp_log" >&2
+    exit 1
+}
 
 cleanup() {
-    kill "$srv_pid" >/dev/null 2>&1 || true
-    wait "$srv_pid" 2>/dev/null || true # the server may write config on shutdown
-    for f in "${BACKUP_FILES[@]}"; do
-        if [ -e "$backup_dir/$f.absent" ]; then rm -f "$CONFIG_DIR/$f"; else cp -p "$backup_dir/$f" "$CONFIG_DIR/$f"; fi
-    done
-    rm -rf "$backup_dir"
+    stop_server
+    [ -n "$SANDBOX" ] && rm -rf "$SANDBOX"
     rm -f "$tmp_log"
 }
 trap cleanup EXIT INT TERM
 
-ready=0
-deadline=$(($(date +%s) + READY_TIMEOUT))
-while [ "$(date +%s)" -lt "$deadline" ]; do
-    if ! kill -0 "$srv_pid" >/dev/null 2>&1; then
-        echo "[ERR] Test server exited during startup. Log:" >&2
-        sed -n '1,140p' "$tmp_log" >&2
-        exit 1
+if [ "$(cat "$TEMPLATE/.complete" 2>/dev/null)" != "$TEMPLATE_STAMP" ]; then
+    echo "[INFO] Creating test template in $TEMPLATE (generates certificates, takes a while)..." >&2
+    rm -rf "$TEMPLATE"
+    mkdir -p "$TEMPLATE/config" "$TEMPLATE/data/www" "$TEMPLATE/data/content/default" "$TEMPLATE/data/firmware" "$TEMPLATE/data/cache" "$TEMPLATE/data/library" "$TEMPLATE/certs/server" "$TEMPLATE/certs/client" "$TEMPLATE/certs/server_tb2" "$TEMPLATE/certs/client/tb2"
+    start_server "$TEMPLATE"
+    if ! wait_ready "$srv_pid" 900 any; then
+        stop_server
+        rm -rf "$TEMPLATE"
+        fail_log "Template server did not become ready"
     fi
-    http_code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP_PORT/web/" || true)
-    if [ "$http_code" = "200" ]; then
-        ready=1
-        break
-    fi
-    sleep 0.2
-done
-
-if [ "$ready" != "1" ]; then
-    echo "[ERR] Test server did not become ready on port $HTTP_PORT within ${READY_TIMEOUT}s. Log:" >&2
-    sed -n '1,140p' "$tmp_log" >&2
-    exit 1
+    stop_server
+    # the cloud client needs a client certificate (normally a genuine box's); any one will do for a fake cloud
+    "$BIN" --base_path "$TEMPLATE" --generate-client-cert 000000000000 --destination "$TEMPLATE/certs/client" >/dev/null
+    openssl x509 -in "$TEMPLATE/certs/server/ca-root.pem" -outform der -out "$TEMPLATE/certs/client/ca.der"
+    echo "$TEMPLATE_STAMP" >"$TEMPLATE/.complete"
 fi
 
-"$@"
+SANDBOX="$(mktemp -d /tmp/teddycloud_sandbox_XXXXXX)"
+cp -a "$TEMPLATE/." "$SANDBOX/"
+rm -f "$SANDBOX/.complete"
+# the web UI is a symlink, so the template stays relocatable (and cacheable)
+[ -d "$WEB_UI" ] && ln -s "$WEB_UI" "$SANDBOX/data/www/web"
+export TC_SANDBOX="$SANDBOX" TC_TEMPLATE="$TEMPLATE" # TC_TEMPLATE: tests may cache things signed by the template CA (box certs) there
+
+start_server "$SANDBOX"
+
+if ! wait_ready "$srv_pid" "$READY_TIMEOUT"; then
+    fail_log "Test server did not become ready on port $HTTP_PORT within ${READY_TIMEOUT}s"
+fi
+
+rc=0
+"$@" || rc=$?
+if [ "$rc" -ne 0 ]; then
+    stop_server # the log is buffered until the server exits
+    echo "[ERR] Test command failed ($rc). Server log, last lines:" >&2
+    # an ASan report is long, show it from its start
+    if grep -q "ERROR: AddressSanitizer" "$tmp_log"; then
+        sed -n '/ERROR: AddressSanitizer/,/^SUMMARY/p' "$tmp_log" | head -60 >&2
+    fi
+    tail -n 40 "$tmp_log" >&2
+    cp "$tmp_log" "$REPO_ROOT/bin/test-last-server.log" && echo "[ERR] full server log: bin/test-last-server.log" >&2
+fi
+exit "$rc"

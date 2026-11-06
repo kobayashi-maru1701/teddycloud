@@ -26,6 +26,7 @@
 #include "esp32.h"
 #include "cache.h"
 #include "libraryMeta.h"
+#include "zip_writer.h"
 
 error_t parsePostData(HttpConnection *connection, char_t *post_data, size_t buffer_size)
 {
@@ -762,6 +763,10 @@ error_t handleApiFileIndexV2(HttpConnection *connection, const char_t *uri, cons
             {
                 cJSON_AddItemToArray(tracksArray, cJSON_CreateNumber(tafInfo->additional.track_positions.pos[i]));
             }
+            if (tafInfo->additional.track_positions.length > 0)
+            {
+                cJSON_AddNumberToObject(tafHeaderEntry, "lengthSeconds", tafInfo->additional.track_positions.length);
+            }
 
             cJSON_AddBoolToObject(jsonEntry, "listened", library_meta_get_listened(filePathAbsolute));
 
@@ -1212,6 +1217,7 @@ error_t file_save_end_cert(void *in_ctx)
         char *path = custom_asprintf("%s%c%s", settings_get_string_ovl("core.certdir", ctx->overlay), PATH_SEPARATOR, name);
         TRACE_INFO("Set %s to %s\r\n", setting, path);
         settings_set_string_ovl(setting, path, ctx->overlay);
+        settings_load_client_certs_id(get_overlay_id(ctx->overlay));
         osFreeMem(path);
     }
     else
@@ -1236,6 +1242,7 @@ error_t handleApiUploadCert(HttpConnection *connection, const char_t *uri, const
         TRACE_DEBUG("got overlay '%s'\r\n", overlay);
     }
     const char *rootPath = settings_get_string_ovl("internal.certdirfull", overlay);
+    error_t dirError = rootPath != NULL && !fsDirExists(rootPath) ? fsCreateDirEx(rootPath, true) : NO_ERROR;
 
     if (rootPath == NULL)
     {
@@ -1243,14 +1250,10 @@ error_t handleApiUploadCert(HttpConnection *connection, const char_t *uri, const
         osSnprintf(message, sizeof(message), "internal.certdirfull not set to a valid path");
         TRACE_ERROR("internal.certdirfull not set to a valid path\r\n");
     }
-    else if (!fsDirExists(rootPath))
+    else if (dirError != NO_ERROR || !fsDirExists(rootPath))
     {
-        error_t error = fsCreateDirEx(rootPath, true);
-        if (error != NO_ERROR || !fsDirExists(rootPath))
-        {
-            osSnprintf(message, sizeof(message), "internal.certdirfull '%s' does not exist and could not be created. Error: %s", rootPath, error2text(error));
-            TRACE_ERROR("internal.certdirfull '%s' does not exist and could not be created. Error: %s\r\n", rootPath, error2text(error));
-        }
+        osSnprintf(message, sizeof(message), "internal.certdirfull '%s' does not exist and could not be created. Error: %s", rootPath, error2text(dirError));
+        TRACE_ERROR("internal.certdirfull '%s' does not exist and could not be created. Error: %s\r\n", rootPath, error2text(dirError));
     }
     else
     {
@@ -1610,6 +1613,8 @@ error_t handleApiESP32PatchFirmware(HttpConnection *connection, const char_t *ur
     char patch_host[32] = {0};
     char wifi_ssid[64] = {0};
     char wifi_pass[64] = {0};
+    char port_text[8] = {0};
+    uint32_t port = 0;
     char filename[255] = {0};
     char mac[13] = {0};
     osStrcpy(old_patch_host, "");
@@ -1632,6 +1637,12 @@ error_t handleApiESP32PatchFirmware(HttpConnection *connection, const char_t *ur
         TRACE_INFO("Patch hostnames with old hostname '%s'\r\n", old_patch_host);
     }
 
+    if (queryGet(queryString, "port", port_text, sizeof(port_text)))
+    {
+        port = (uint32_t)strtoul(port_text, NULL, 10);
+        TRACE_INFO("Patch port %" PRIu32 "\r\n", port);
+    }
+
     if (queryGet(queryString, "wifi_ssid", wifi_ssid, sizeof(wifi_ssid)))
     {
         TRACE_INFO("wifi ssid '%s'\r\n", wifi_ssid);
@@ -1642,6 +1653,13 @@ error_t handleApiESP32PatchFirmware(HttpConnection *connection, const char_t *ur
         TRACE_INFO("wifi pass '%s'\r\n", wifi_pass);
     }
 
+    /* filename is joined to the firmware dir; reject separators and ".." */
+    if (osStrchr(filename, '/') || osStrchr(filename, '\\') || osStrstr(filename, ".."))
+    {
+        TRACE_ERROR("Invalid firmware filename '%s'\r\n", filename);
+        return ERROR_NOT_FOUND;
+    }
+
     const char *sep = osStrchr(filename, '_');
     if (!sep || strlen(&sep[1]) < 12)
     {
@@ -1650,6 +1668,16 @@ error_t handleApiESP32PatchFirmware(HttpConnection *connection, const char_t *ur
     }
     osStrncpy(mac, &sep[1], 12);
     mac[12] = 0;
+
+    /* mac ends up in file/dir names; require 12 hex chars so it cannot contain separators or ".." */
+    for (size_t i = 0; i < 12; i++)
+    {
+        if (!((mac[i] >= '0' && mac[i] <= '9') || (mac[i] >= 'a' && mac[i] <= 'f') || (mac[i] >= 'A' && mac[i] <= 'F')))
+        {
+            TRACE_ERROR("Invalid MAC '%s'\r\n", mac);
+            return ERROR_NOT_FOUND;
+        }
+    }
 
     char *file_path = custom_asprintf("%s%c%s", rootPath, PATH_SEPARATOR, filename);
     char *patched_path = custom_asprintf("%s%cpatched_%s.bin", rootPath, PATH_SEPARATOR, mac);
@@ -1701,6 +1729,15 @@ error_t handleApiESP32PatchFirmware(HttpConnection *connection, const char_t *ur
         if (esp32_patch_host(patched_path, patch_host, oldrtnl, oldapi) != NO_ERROR)
         {
             TRACE_ERROR("Failed to patch hostnames\r\n");
+            return ERROR_NOT_FOUND;
+        }
+    }
+
+    if (port != 0)
+    {
+        if (esp32_patch_port(patched_path, port) != NO_ERROR)
+        {
+            TRACE_ERROR("Failed to patch port\r\n");
             return ERROR_NOT_FOUND;
         }
     }
@@ -1863,16 +1900,25 @@ static void sanitize_track_title(const char *in, char *out, size_t out_len)
     {
         in = "";
     }
-    for (size_t i = 0; in[i] != '\0' && j + 1 < out_len; i++)
+    for (size_t i = 0; in[i] != '\0';)
     {
         unsigned char c = (unsigned char)in[i];
+        /* length of the UTF-8 sequence, so a truncated title never ends in half a character */
+        size_t len = (c >= 0xF0) ? 4 : (c >= 0xE0) ? 3 : (c >= 0xC0) ? 2 : 1;
+
+        if (j + len + 1 > out_len)
+        {
+            break;
+        }
         if (c < 0x20 || c == '/' || c == '\\' || c == '"' || c == '`' || c == '$')
         {
             out[j++] = '_';
+            i++;
+            continue;
         }
-        else
+        for (size_t k = 0; k < len && in[i] != '\0'; k++)
         {
-            out[j++] = (char)c;
+            out[j++] = in[i++];
         }
     }
     out[j] = '\0';
@@ -1952,6 +1998,7 @@ static error_t handleApiContentTrackExport(HttpConnection *connection, const cha
     int track_numbers[TAF_TRACK_EXPORT_MAX];
     char titles[TAF_TRACK_EXPORT_MAX][96];
     char *out_paths[TAF_TRACK_EXPORT_MAX];
+    char *entry_names[TAF_TRACK_EXPORT_MAX];
     size_t page_count = 0;
     size_t track_count = 0;
     uint64_t num_bytes = 0;
@@ -1959,6 +2006,7 @@ static error_t handleApiContentTrackExport(HttpConnection *connection, const cha
     error_t error = NO_ERROR;
 
     osMemset(out_paths, 0, sizeof(out_paths));
+    osMemset(entry_names, 0, sizeof(entry_names));
     osMemset(titles, 0, sizeof(titles));
 
     src = fopen(file_path, "rb");
@@ -2031,7 +2079,7 @@ static error_t handleApiContentTrackExport(HttpConnection *connection, const cha
             if (end == p || value < 1 || (size_t)value > page_count)
             {
                 fclose(src);
-                return ERROR_INVALID_PARAMETER;
+                return httpSendErrorResponse(connection, 400, "Invalid track selection");
             }
             track_numbers[track_count++] = (int)value;
             p = end;
@@ -2040,7 +2088,7 @@ static error_t handleApiContentTrackExport(HttpConnection *connection, const cha
     if (track_count == 0)
     {
         fclose(src);
-        return ERROR_INVALID_PARAMETER;
+        return httpSendErrorResponse(connection, 400, "Invalid track selection");
     }
 
     if (create_taf_temp_dir(settings, tmpdir, sizeof(tmpdir)) != NO_ERROR)
@@ -2081,6 +2129,7 @@ static error_t handleApiContentTrackExport(HttpConnection *connection, const cha
             break;
         }
 
+        /* the title only goes into the zip entry name, the temp file name stays ASCII */
         if (titles[chapter][0] != '\0')
         {
             osSnprintf(name, sizeof(name), "%02d %s.ogg", track_numbers[i], titles[chapter]);
@@ -2089,7 +2138,7 @@ static error_t handleApiContentTrackExport(HttpConnection *connection, const cha
         {
             osSnprintf(name, sizeof(name), "%02d.ogg", track_numbers[i]);
         }
-        osSnprintf(path, sizeof(path), "%s/%s", tmpdir, name);
+        osSnprintf(path, sizeof(path), "%s/%02d.ogg", tmpdir, track_numbers[i]);
         dst = fopen(path, "wb");
         if (dst == NULL)
         {
@@ -2110,7 +2159,8 @@ static error_t handleApiContentTrackExport(HttpConnection *connection, const cha
             break;
         }
         out_paths[i] = strdup(path);
-        if (out_paths[i] == NULL)
+        entry_names[i] = strdup(name);
+        if (out_paths[i] == NULL || entry_names[i] == NULL)
         {
             error = ERROR_FAILURE;
             break;
@@ -2131,22 +2181,9 @@ static error_t handleApiContentTrackExport(HttpConnection *connection, const cha
     else
     {
         char zip_path[TAF_TEMP_FILE_LEN];
-        char *argv[5 + TAF_TRACK_EXPORT_MAX + 1];
-        size_t n = 0;
 
         osSnprintf(zip_path, sizeof(zip_path), "%s/tracks.zip", tmpdir);
-        argv[n++] = "zip";
-        argv[n++] = "-j";
-        argv[n++] = "-q";
-        argv[n++] = "-X";
-        argv[n++] = zip_path;
-        for (size_t i = 0; i < track_count; i++)
-        {
-            argv[n++] = out_paths[i];
-        }
-        argv[n] = NULL;
-
-        if (osSpawnvp("zip", argv) != 0)
+        if (zipWriteStored(zip_path, track_count, (const char *const *)out_paths, (const char *const *)entry_names) != NO_ERROR)
         {
             TRACE_ERROR("Failed to zip selected TAF tracks from %s\r\n", file_path);
             error = ERROR_FAILURE;
@@ -2162,10 +2199,8 @@ cleanup:
     }
     for (size_t i = 0; i < track_count; i++)
     {
-        if (out_paths[i] != NULL)
-        {
-            free(out_paths[i]);
-        }
+        free(out_paths[i]);
+        free(entry_names[i]);
     }
     if (have_dir)
     {
@@ -2272,7 +2307,9 @@ error_t handleApiContent(HttpConnection *connection, const char_t *uri, const ch
         connection->response.statusCode = 200;
         connection->response.contentLength = length;
     }
-    connection->response.contentType = "audio/ogg";
+    /* content files are mostly extensionless TAFs, but tag configs are JSON (iOS names the download after the type) */
+    const char *ext = strrchr(uri, '.');
+    connection->response.contentType = (ext != NULL && !osStrcasecmp(ext, ".json")) ? "application/json" : "audio/ogg";
     connection->response.chunkedEncoding = FALSE;
 
     error = httpWriteHeader(connection);
@@ -2372,6 +2409,27 @@ error_t handleApiContentDownload(HttpConnection *connection, const char_t *uri, 
 
     char *path = (char *)uri + 1 + 7 + 1 + 8 + 1;
     char *pathAbsolute = custom_asprintf("%s%c%s", rootPath, PATH_SEPARATOR, path);
+
+    char tracks_param[TAF_TRACK_EXPORT_MAX * 4];
+    if (queryGet(queryString, "tracks", tracks_param, sizeof(tracks_param)))
+    {
+        /* export from the TAF the tag points to (e.g. a lib:// source), same as /content/ does */
+        tonie_info_t *tonieInfo = getTonieInfo(pathAbsolute, false, client_ctx->settings);
+        osFreeMem(pathAbsolute);
+
+        error_t export_error = ERROR_NOT_FOUND;
+        if (tonieInfo->exists && tonieInfo->valid &&
+            (tonieInfo->json._source_type == CT_SOURCE_NONE || tonieInfo->json._source_type == CT_SOURCE_TAF || tonieInfo->json._source_type == CT_SOURCE_TAP_CACHED))
+        {
+            export_error = handleApiContentTrackExport(connection, tonieInfo->contentPath, tracks_param, client_ctx->settings);
+        }
+        else
+        {
+            TRACE_ERROR("No local TAF for track export of '%s'\r\n", path);
+        }
+        freeTonieInfo(tonieInfo);
+        return export_error;
+    }
 
     char ruid[17];
 
@@ -4931,6 +4989,10 @@ error_t getTagInfoJson(char ruid[17], cJSON *jsonTarget, client_ctx_t *client_ct
             for (size_t i = 0; i < tafInfo->additional.track_positions.count; i++)
             {
                 cJSON_AddItemToArray(tracksArray, cJSON_CreateNumber(tafInfo->additional.track_positions.pos[i]));
+            }
+            if (tafInfo->additional.track_positions.length > 0)
+            {
+                cJSON_AddNumberToObject(jsonEntry, "lengthSeconds", tafInfo->additional.track_positions.length);
             }
 
             char *downloadUrl = custom_asprintf("/content/download/%s?overlay=%s", tagPath, client_ctx->settings->internal.overlayUniqueId);

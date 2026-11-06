@@ -15,15 +15,12 @@ EXECUTABLE     = $(BIN_DIR)/teddycloud$(EXEC_EXT)
 LINK_LO_FILE   = $(EXECUTABLE).lo
 PLATFORM      ?= linux
 OPTI_LEVEL    ?= -O2
-TEST_API_HTTP_PORT ?= 18080
-TEST_API_HTTPS_PORT ?= 18443
-TEST_API_HTTPS_API_PORT ?= 18444
-TEST_AUTH_HTTP_PORT ?= 18090
-TEST_AUTH_HTTPS_PORT ?= 18453
-TEST_AUTH_HTTPS_API_PORT ?= 18454
-TEST_WEB_LEGACY_HTTP_PORT ?= 18100
-TEST_WEB_LEGACY_HTTPS_PORT ?= 18463
-TEST_WEB_LEGACY_HTTPS_API_PORT ?= 18464
+TEST_API_HTTP_PORT ?= 0
+TEST_API_HTTPS_PORT ?= 0
+TEST_API_HTTPS_API_PORT ?= 0
+TEST_AUTH_HTTP_PORT ?= 0
+TEST_AUTH_HTTPS_PORT ?= 0
+TEST_AUTH_HTTPS_API_PORT ?= 0
 
 ifeq ($(OS),Windows_NT)
 	SHELL_ENV ?= cmd
@@ -110,6 +107,11 @@ build_version:=vX.X.X
 build_gitTagPrefix:=$(firstword $(subst _, ,$(build_gitTag)))
 ifeq ($(build_gitTagPrefix),tc)
 	build_version:=$(subst ${build_gitTagPrefix}_,,${build_gitTag})
+	CFLAGS_VERSION+=-DBUILD_VERSION=\"${build_version}\"
+endif
+# release candidates: rc_v0.7.1 -> v0.7.1-rc, rc_v0.7.1-1 -> v0.7.1-rc1, rc_v0.7.1-rc0 stays as it is
+ifeq ($(build_gitTagPrefix),rc)
+	build_version:=$(shell echo '$(build_gitTag)' | sed -E 's/^rc_//; s/^(v[0-9.]+)$$/\1-rc/; s/^(v[0-9.]+)-([0-9]+)$$/\1-rc\2/')
 	CFLAGS_VERSION+=-DBUILD_VERSION=\"${build_version}\"
 endif
 
@@ -808,57 +810,42 @@ dev-sandbox-restart: dev-sandbox-down
 		$(MAKE) dev-sandbox-up; \
 	fi
 
-.PHONY: test_api_custom_json
-test_api_custom_json:
-	$(QUIET)$(ECHO) "[ ${CYAN}TEST${NC} ] Run custom JSON API tests against running server"
-	$(QUIET)TEDDYCLOUD_BASE_URL=http://127.0.0.1:80 python3 tests/py/test_tonies_custom_json_api.py
-
-.PHONY: test_api_custom_json_with_server
-test_api_custom_json_with_server: build
-	$(QUIET)$(ECHO) "[ ${CYAN}TEST${NC} ] Start server, run custom JSON API tests, stop server"
-	$(QUIET)tests/py/with_server.sh $(TEST_API_HTTP_PORT) $(TEST_API_HTTPS_PORT) $(TEST_API_HTTPS_API_PORT) 30 -- \
-		env TEDDYCLOUD_BASE_URL=http://127.0.0.1:$(TEST_API_HTTP_PORT) python3 tests/py/test_tonies_custom_json_api.py
-
 TEST_C_SRC := $(wildcard tests/c/*.c)
 
 .PHONY: test_c
 test_c:
 	$(QUIET)$(ECHO) "[ ${CYAN}TEST${NC} ] Build and run C unit tests"
 	$(QUIET)mkdir -p $(BIN_DIR)
-	$(QUIET)$(CC) -I include -I cyclone/common -ffunction-sections -Wl,--gc-sections -o $(BIN_DIR)/test_c $(TEST_C_SRC) $(SRC_DIR)/os_ext.c $(SRC_DIR)/str_ext.c $(SRC_DIR)/fs_ext.c
+	$(QUIET)$(CC) -I include -I src/cyclone/common -I src/cyclone/cyclone_tcp -I cyclone/common -I cyclone/cyclone_tcp -I cyclone/cyclone_ssl -I cyclone/cyclone_crypto -D GPL_LICENSE_TERMS_ACCEPTED -ffunction-sections -Wl,--gc-sections -o $(BIN_DIR)/test_c $(TEST_C_SRC) $(SRC_DIR)/os_ext.c $(SRC_DIR)/str_ext.c $(SRC_DIR)/fs_ext.c $(SRC_DIR)/esp32_port.c $(SRC_DIR)/platform/platform_linux.c $(SRC_DIR)/cyclone/common/os_port_posix.c $(SRC_DIR)/box_cert.c $(SRC_DIR)/zip_writer.c
 	$(QUIET)$(BIN_DIR)/test_c
 
 .PHONY: test
-test: test_c test_api_custom_json_with_server test_auth_pool_reuse_with_server test_web_legacy_gone_with_server test_cors_preflight_with_server test_hardening_with_server
+test: test_c test_py test_auth_pool_reuse_with_server
 
-HARDENING_TESTS := Cache499 Multipart502 Firmware503 Encode501 Tap495 Crawler508 KeyPermissions512 Secrets505 Traversal513 Range515 Extract522 Settings528
+PYTHON ?= python3
+# every test_*.py is picked up automatically; test_hardening.py is split per class, so a crash only fails its own test
+# every entry gets a fresh sandboxed server (see tests/py/with_server.sh)
+HARDENING_TESTS := $(shell sed -n 's/^class \([A-Za-z0-9]*\)(\(Base\|Ota\)):.*/\1/p' tests/py/test_hardening.py | grep -vx Ota)
+PY_TESTS := $(filter-out tests/py/test_hardening.py tests/py/test_auth_pool_reuse.py,$(sort $(wildcard tests/py/test_*.py))) \
+	$(addprefix tests/py/test_hardening.py::,$(HARDENING_TESTS))
 
-# one fresh server per test class, a crash must only fail its own test.
+# make test_py TESTS=cors            only entries containing "cors"
+# make test_py PYTEST_ARGS="-k name" extra pytest arguments
 # ASan fills only the first 4 KiB of a new allocation with garbage by default;
 # filling all of it makes use of uninitialised memory fail reliably (Tap495).
-.PHONY: test_hardening_with_server
-test_hardening_with_server: build
-	$(QUIET)$(ECHO) "[ ${CYAN}TEST${NC} ] Start a fresh server per test, run robustness tests, stop server"
-	$(QUIET)rc=0; for t in $(HARDENING_TESTS); do \
+.PHONY: test_py
+test_py: build
+	$(QUIET)$(ECHO) "[ ${CYAN}TEST${NC} ] Run pytest, a fresh sandboxed server per entry"
+	$(QUIET)$(PYTHON) -m pytest --version >/dev/null 2>&1 || { echo "pytest is missing: pip install pytest (or apt install python3-pytest)"; exit 1; }
+	$(QUIET)rc=0; for t in $(PY_TESTS); do \
+		[ -z "$(TESTS)" ] || echo "$$t" | grep -q -- "$(TESTS)" || continue; \
 		ASAN_OPTIONS="$${ASAN_OPTIONS:+$$ASAN_OPTIONS:}max_malloc_fill_size=1073741824" \
-		tests/py/with_server.sh $(TEST_API_HTTP_PORT) $(TEST_API_HTTPS_PORT) $(TEST_API_HTTPS_API_PORT) 30 -- \
-			env TEDDYCLOUD_BASE_URL=http://127.0.0.1:$(TEST_API_HTTP_PORT) python3 tests/py/test_hardening.py $$t || rc=1; \
+		tests/py/with_server.sh $(TEST_API_HTTP_PORT) $(TEST_API_HTTPS_PORT) $(TEST_API_HTTPS_API_PORT) 60 -- \
+			$(PYTHON) -m pytest -q $(PYTEST_ARGS) $$t || rc=1; \
 	done; exit $$rc
-
-.PHONY: test_cors_preflight_with_server
-test_cors_preflight_with_server: build
-	$(QUIET)$(ECHO) "[ ${CYAN}TEST${NC} ] Start server, run CORS preflight test, stop server"
-	$(QUIET)tests/py/with_server.sh $(TEST_API_HTTP_PORT) $(TEST_API_HTTPS_PORT) $(TEST_API_HTTPS_API_PORT) 30 -- \
-		env TEDDYCLOUD_BASE_URL=http://127.0.0.1:$(TEST_API_HTTP_PORT) python3 tests/py/test_cors_preflight.py
 
 .PHONY: test_auth_pool_reuse_with_server
 test_auth_pool_reuse_with_server: build
 	$(QUIET)$(ECHO) "[ ${CYAN}TEST${NC} ] Start server, run pooled-connection auth regression test, stop server"
-	$(QUIET)tests/py/with_server.sh $(TEST_AUTH_HTTP_PORT) $(TEST_AUTH_HTTPS_PORT) $(TEST_AUTH_HTTPS_API_PORT) 600 -- \
-		env TEDDYCLOUD_HTTPS_API_PORT=$(TEST_AUTH_HTTPS_API_PORT) tests/py/run_auth_pool_reuse.sh
-
-.PHONY: test_web_legacy_gone_with_server
-test_web_legacy_gone_with_server: build
-	$(QUIET)$(ECHO) "[ ${CYAN}TEST${NC} ] Start server, verify legacy admin GUI is gone, stop server"
-	$(QUIET)tests/py/with_server.sh $(TEST_WEB_LEGACY_HTTP_PORT) $(TEST_WEB_LEGACY_HTTPS_PORT) $(TEST_WEB_LEGACY_HTTPS_API_PORT) 600 -- \
-		env TEDDYCLOUD_BASE_URL=http://127.0.0.1:$(TEST_WEB_LEGACY_HTTP_PORT) python3 tests/py/test_web_legacy_gone.py
+	$(QUIET)tests/py/with_server.sh $(TEST_AUTH_HTTP_PORT) $(TEST_AUTH_HTTPS_PORT) $(TEST_AUTH_HTTPS_API_PORT) 60 -- \
+		tests/py/run_auth_pool_reuse.sh
