@@ -1,4 +1,5 @@
 
+#include "error_text.h"
 #include <sys/types.h>
 #include <time.h>
 #include <stdbool.h>
@@ -64,6 +65,7 @@ typedef struct
 reverse_target_t reverse_targets[] = {
     {"macvendor", "api.macvendors.com", "/", 443, true, true, true, 24, false, "text/plain"},
     {"teddycloud_release", "api.github.com", "/repos/toniebox-reverse-engineering/teddycloud/releases/latest", 443, true, false, true, 24, true, "application/json"},
+    {"teddycloud_release_candidate", "api.github.com", "/repos/toniebox-reverse-engineering/teddycloud/git/matching-refs/tags/rc", 443, true, false, true, 1, true, "application/json"},
     {"teddycloud_develop", "api.github.com", "/repos/toniebox-reverse-engineering/teddycloud/commits/develop", 443, true, false, true, 1, true, "application/json"},
     {NULL, NULL, NULL, 0, false, false, false, 0, false, NULL}};
 

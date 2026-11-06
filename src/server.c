@@ -1,5 +1,6 @@
 
 
+#include "error_text.h"
 #include <errno.h>     // for error_t
 #include <stdint.h>    // for uint8_t
 #include <stdio.h>     // for printf
@@ -34,6 +35,8 @@
 #include "mqtt_server.h"          // for mqtt_server_init, mqtt_server_task
 #include "stdbool.h"              // for true, bool, false
 #include "tls.h"                  // for _TlsContext, tlsLoadCertificate
+#include "box_cert.h"             // for box_cert_id, box_cert_issuer_known
+#include "box_cert_check.h"       // for box_cert_accepted
 #include "tls_adapter.h"          // for tls_context_key_log_init, tlsCache
 #include "toniebox_state.h"       // for get_toniebox_state, get_toniebox_s...
 #include "toniebox_state_type.h"  // for toniebox_state_box_t, toniebox_sta...
@@ -274,7 +277,7 @@ error_t handleCacheDownload(HttpConnection *connection, const char_t *uri, const
         return httpSendRedirectResponse(connection, 301, entry->original_url);
     }
 
-    error_t err = httpSendResponseUnsafe(connection, uri, entry->file_path);
+    error_t err = httpExtSendResponseUnsafe(connection, uri, entry->file_path);
     return err;
 }
 
@@ -285,7 +288,7 @@ static error_t handleCorsOptions(
     client_ctx_t *client_ctx)
 {
     char line[256];
-    const char_t *allowOrigin = connection->serverContext->settings.allowOrigin;
+    const char_t *allowOrigin = httpExtAllowOrigin();
 
     osSnprintf(line, sizeof(line), "HTTP/%d.%d 204 No Content\r\n", MSB(connection->request.version), LSB(connection->request.version));
 
@@ -341,6 +344,7 @@ error_t httpServerRequestCallback(HttpConnection *connection, const char_t *uri,
         TRACE_DEBUG("  Issuer:     '%s'\r\n", connection->tlsContext->client_cert_issuer);
         TRACE_DEBUG("  Subject:    '%s'\r\n", connection->tlsContext->client_cert_subject);
         TRACE_DEBUG("  Serial:     '%s'\r\n", connection->tlsContext->client_cert_serial);
+        TRACE_DEBUG("  SHA256:     '%s'\r\n", connection->tlsContext->client_cert_sha256);
         request_source = connection->tlsContext->client_cert_subject;
     }
     else
@@ -364,44 +368,28 @@ error_t httpServerRequestCallback(HttpConnection *connection, const char_t *uri,
         char_t *issuer = connection->tlsContext->client_cert_issuer;
         uint32_t boxGen = GENERATION_UNKNOWN;
 
-        if (osStrstr(issuer, "Boxine Factory SubCA") != NULL || osStrstr(issuer, "Toniebox SubCA") != NULL
-            || osStrstr(issuer, "TeddyCloud") != NULL || osStrstr(subject, "TeddyCloud") != NULL || osStrstr(issuer, "Toniebox Root CA") != NULL)
+        if (box_cert_issuer_known(issuer, subject))
         {
-            char_t *commonName = NULL;
-            if (osStrlen(subject) == 15 && !osStrncmp(subject, "b'", 2) && subject[14] == '\'') // tonies standard cn with b'[MAC]'
+            char_t boxId[BOX_CERT_ID_SIZE];
+            bool hasBoxId = box_cert_id(subject, boxId);
+            const char_t *commonName = hasBoxId ? boxId : subject;
+
+            if (hasBoxId && get_overlay_id(commonName) == 0)
             {
-                commonName = strdup(&subject[2]);
-                commonName[osStrlen(commonName) - 1] = '\0';
-            } else if (osStrlen(subject) == 12) {
-                commonName = strdup(subject);
-            }
-            if (commonName != NULL) {
-                if (get_overlay_id(commonName) == 0)
+                if (client_ctx->settings->core.allowNewBox)
                 {
-                    if (client_ctx->settings->core.allowNewBox)
-                    {
-                        TRACE_INFO("Added new client certificate with CN=%s\n", commonName);
-                    }
-                    else
-                    {
-                        TRACE_WARNING("Found unknown client certificate with CN=%s\n", commonName);
-                    }
+                    TRACE_INFO("Added new client certificate with CN=%s\n", commonName);
                 }
-                if (get_overlay_id(commonName) > 0 || client_ctx->settings->core.allowNewBox)
+                else
                 {
-                    client_ctx->settings = get_settings_cn(commonName);
-                    connection->private.authenticated = client_ctx->settings->toniebox.api_access;
+                    TRACE_WARNING("Found unknown client certificate with CN=%s\n", commonName);
                 }
-                osFreeMem(commonName);
-                // TODO: CHECK THE CERTIFICATES FOR REAL!!!!!
             }
-            else
+            if (get_overlay_id(commonName) > 0 || client_ctx->settings->core.allowNewBox)
             {
-                if (get_overlay_id(subject) > 0 || client_ctx->settings->core.allowNewBox)
-                {
-                    client_ctx->settings = get_settings_cn(subject);
-                    connection->private.authenticated = client_ctx->settings->toniebox.api_access;
-                }
+                client_ctx->settings = get_settings_cn(commonName);
+                connection->private.authenticated = client_ctx->settings->toniebox.api_access &&
+                                                    box_cert_accepted(connection->tlsContext, client_ctx->settings);
             }
             client_ctx->state = get_toniebox_state_id(client_ctx->settings->internal.overlayNumber);
 
@@ -560,7 +548,7 @@ error_t httpServerRequestCallback(HttpConnection *connection, const char_t *uri,
             break;
         }
 
-        if (connection->settings->isHttps && client_ctx->settings->core.boxCertAuth && connection->private.api_access_only && !connection->private.authenticated)
+        if (httpExtIsHttps(connection) && client_ctx->settings->core.boxCertAuth && connection->private.api_access_only && !connection->private.authenticated)
         {
             error = httpServerUriUnauthorizedCallback(connection, uri);
             break;
@@ -621,7 +609,7 @@ error_t httpServerRequestCallback(HttpConnection *connection, const char_t *uri,
 
             char_t *newUri = custom_asprintf("%s%s", client_ctx->settings->core.wwwdir, uri);
 
-            error = httpSendResponse(connection, newUri);
+            error = httpExtSendResponse(connection, newUri);
             free(newUri);
         }
         else
@@ -784,11 +772,13 @@ static error_t httpServerConfigureTls(
 
     tls_context_key_log_init(tlsContext);
 
-    // Session cache that will be used to save/resume TLS sessions
-    error = tlsSetCache(tlsContext, tlsCache);
-    // Any error to report?
-    if (error)
-        return error;
+    // A resumed session carries no client certificate, so the box cannot be identified on it
+    if (authMode == TLS_CLIENT_AUTH_NONE)
+    {
+        error = tlsSetCache(tlsContext, tlsCache);
+        if (error)
+            return error;
+    }
 
     // Enable secure renegotiation, otherwise modern OpenSSL clients (e.g., Python 3 requests) reject the connection
     error = tlsEnableSecureRenegotiation(tlsContext, TRUE);
@@ -951,16 +941,13 @@ void server_init(bool test)
     http_settings.uriNotFoundCallback = httpServerUriNotFoundCallback;
     http_settings.authCallback = httpServerAuthCallback;
     http_settings.port = settings_get_unsigned("core.server.http_port");
-    http_settings.allowOrigin = strdup(settings_get_string("core.allowOrigin"));
-    http_settings.isHttps = false;
+    httpExtSetAllowOrigin(settings_get_string("core.allowOrigin"));
 
     /* use them for HTTPS */
     https_web_settings = http_settings;
     https_web_settings.connections = httpsWebConnections;
     https_web_settings.port = settings_get_unsigned("core.server.https_web_port");
     https_web_settings.tlsInitCallback = httpServerTlsInitCallback;
-    https_web_settings.allowOrigin = strdup(settings_get_string("core.allowOrigin"));
-    https_web_settings.isHttps = true;
 
     /* use them for Box HTTPS */
     https_api_settings = https_web_settings;

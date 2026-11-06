@@ -66,13 +66,64 @@ for how these fit together.
 TeddyCloud vendors the Oryx Embedded **CycloneTCP / CycloneSSL / CycloneCrypto** stack
 under `cyclone/` (git submodules) plus a few other libraries (cJSON, opus, ogg, FatFs).
 
-**Don't edit the vendored submodule sources directly.** Where TeddyCloud needs to change
-vendored behaviour, it keeps a *patched copy* under `src/cyclone/…` and the `Makefile`
-compiles that instead of the submodule original (the `-Isrc/cyclone/…` include path takes
-precedence). If you must change a vendored file: copy it unmodified from the submodule into
-the matching path under `src/cyclone/…`, then make your change on that copy. Don't run the
-auto-formatter on it — keep the copy identical to upstream except for the actual patch, so
-the diff against upstream stays reviewable.
+**Don't edit the vendored submodule sources directly, and avoid patching them at all** - every
+patched line has to be re-ported on each Cyclone update. In order of preference:
+
+1. **TeddyCloud code outside the vendored tree.** Wrapper headers found first through `-Iinclude`
+   (`include/debug.h`), the configuration macros (`include/os_port_config.h`, `net_config.h`,
+   `tls_config.h`), and the hooks Cyclone offers (`HTTP_*_HOOK`, `*_CONTEXT_PRIVATE`,
+   `HTTP_*_PRIVATE_HEADER_FIELDS`; see `include/http_ext.h`).
+2. **Replace a weak Cyclone function** with your own strong definition. Cyclone's version is renamed
+   with a per-object `-D` in the `Makefile`, which also works with MSVC (no weak symbols), see
+   `tlsParseCertificateList` and `mpiCheckProbablePrime`.
+3. **Only if neither works, a minimal patched copy** under `src/cyclone/...` (the `-Isrc/cyclone/...`
+   include path takes precedence). Copy the file unmodified from the submodule, then make the change
+   on the copy; don't run the auto-formatter on it. Keep the copy identical to upstream except for the
+   patch, and don't keep unmodified copies of headers: they would shadow the newer ones after an update.
+   Today these are about 60 lines in 5 files, the rest is the RTNL `*binary` hook, musl casts and
+   pcap logging.
+
+Updating Cyclone: move the four submodules to the new tag, adapt the source lists and include paths in
+the `Makefile`, port the TeddyCloud code to the changed APIs, re-port the remaining patches onto the new
+files and run `make test` plus the complete Docker matrix (`publish_docker_matrix_all.yml` with
+`dry_run=true` and `full_matrix=true`; dry runs and pull requests are otherwise fast and skip the emulated Alpine builds).
+
+## Releases and release candidates
+
+A release is a tag `tc_vX.Y.Z`: it builds the zips, a draft GitHub release and the Docker images
+`X.Y.Z`, `X.Y`, `X` and `latest`.
+
+A **release candidate** has its own tag prefix `rc_` and so never touches the release machinery. Tag a
+commit that is on `develop`:
+
+    git fetch origin
+    git tag rc_v0.7.1 origin/develop          # the first candidate of 0.7.1
+    git push origin rc_v0.7.1
+    # further candidates of the same version: rc_v0.7.1-1, rc_v0.7.1-2 (or rc_v0.7.1-rc1, ...)
+
+It publishes **Docker images only** (no GitHub release): `rc` (the newest candidate of anything),
+`rc0.7.1` (the newest candidate of 0.7.1) and, for a suffixed tag, the exact `rc0.7.1-1` (or
+`rc0.7.1-rc1`) plus the git tag name. `latest`, `0`, `0.7` and `0.7.1` never move, a check in the
+workflow fails the run before pushing if they would. The binary reports `v0.7.1-rc` / `v0.7.1-rc1`.
+An `rc_` tag whose commit is not reachable from `develop` is refused. Candidate runs are queued one
+at a time (the `rc` tags move), so don't re-run an old candidate. Nothing is merged to `master`.
+
+### Promoting a good candidate to a release
+
+Release exactly the commit that was tested, so the release is the candidate. Releases so far are a merge of a
+`develop` commit into `master` (commit message `vX.Y.Z`) and a `tc_vX.Y.Z` tag on that `develop` commit:
+
+    git fetch origin --tags
+    git checkout master && git pull --ff-only origin master
+    git merge --no-ff rc_v0.7.1 -m "v0.7.1"      # the tested commit, not the current develop tip
+    git push origin master
+    git tag tc_v0.7.1 rc_v0.7.1^{commit}         # same commit as the candidate (use rc_v0.7.1-N if that was the good one)
+    git push origin tc_v0.7.1
+
+The `tc_v...` tag builds the zips and a **draft** GitHub release (publish it by hand) and the Docker images
+`0.7.1`, `0.7`, `0` and `latest`. The `rc` / `rc0.7.1` image tags are left alone. If the candidate was not good,
+fix it on `develop` and cut `rc_v0.7.1-1`. Run the "Make web and commit" workflow *before* tagging a candidate if
+the frontend changed, so the candidate already contains the frontend that will be released.
 
 ## Code style
 

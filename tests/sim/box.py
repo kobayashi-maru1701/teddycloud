@@ -24,6 +24,7 @@ class Box:
             if profile.generation == 2:
                 raise NotImplementedError("TB2 needs the EC client certificate of the server_tb2 CA and its TLS chain, not simulated yet")
         self.profile = profile
+        self._contexts = {}
         self.mac = mac.lower()
         self.host = host
         self.port = https_port
@@ -52,8 +53,14 @@ class Box:
     def close(self):
         self._dir.cleanup()
 
-    def connect(self, use_cert=True):
+    def connect(self, use_cert=True, session=None):
         # IP literal: no SNI, like a real box (the server picks other certs when SNI is present)
+        ctx = self._contexts.get(use_cert) or self._context(use_cert)
+        return ctx.wrap_socket(socket.create_connection((self.host, self.port), timeout=5),
+                               server_hostname=(self.profile.tls.sni if self.profile and self.profile.tls.sni else None),
+                               session=session)
+
+    def _context(self, use_cert):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -65,11 +72,12 @@ class Box:
                 ctx.set_ciphers(tls.ciphers)
         if use_cert:
             ctx.load_cert_chain(certfile=self.cert, keyfile=self.key)
-        return ctx.wrap_socket(socket.create_connection((self.host, self.port), timeout=5), server_hostname=(tls.sni if tls and tls.sni else None))
+        self._contexts[use_cert] = ctx
+        return ctx
 
-    def request(self, method, path, body=b"", headers=None, use_cert=True):
+    def request(self, method, path, body=b"", headers=None, use_cert=True, session=None):
         """One request on a fresh connection. Returns (status, headers, body)."""
-        s = self.connect(use_cert)
+        s = self.connect(use_cert, session)
         try:
             head = f"{method} {path} HTTP/1.1\r\nHost: {self.host}\r\nUser-Agent: {self.user_agent}\r\nConnection: close\r\n"
             head += f"Content-Length: {len(body)}\r\n" + "".join(f"{k}: {v}\r\n" for k, v in (headers or {}).items())
@@ -83,6 +91,18 @@ class Box:
         lines = raw_head.decode(errors="replace").split("\r\n")
         return int(lines[0].split()[1]), dict(l.split(": ", 1) for l in lines[1:] if ": " in l), payload
 
+    def keep_alive(self):
+        """A connection that sends requests like the firmware does, see BoxConnection."""
+        return BoxConnection(self)
+
+    def openssl_request(self, method, path):
+        """One request over openssl s_client with the profile's TLS parameters (signature algorithms,
+        curves), which Python's ssl module cannot set. Returns the raw response."""
+        req = f"{method} {path} HTTP/1.1\r\nHost: {self.host}\r\nUser-Agent: {self.user_agent}\r\nConnection: close\r\n\r\n"
+        cmd = ["openssl", "s_client", "-connect", f"{self.host}:{self.port}", "-noservername", "-quiet", "-ign_eof",
+               "-cert", str(self.cert), "-key", str(self.key), *self.profile.tls.openssl]
+        return subprocess.run(cmd, input=req.encode(), capture_output=True, timeout=10).stdout
+
     def rtnl(self, *frames, keep_open=False):
         """Sends raw RTNL frames (see rtnl.frame). Returns the socket if keep_open."""
         s = self.connect()
@@ -92,6 +112,69 @@ class Box:
             return s
         time.sleep(0.3)  # a real box keeps the connection open; let the server read before the close
         s.close()
+
+
+class BoxConnection:
+    """Keep-alive connection with the request format of the profile: Host and User-Agent, the profile's
+    extra headers, Content-Length only with a body, and the body in its own TLS record."""
+
+    def __init__(self, box):
+        self.box = box
+        self.sock = box.connect()
+        self._buf = b""
+
+    def request(self, method, path, body=b"", headers=None):
+        p = self.box.profile
+        lines = [f"{method} {path} HTTP/1.1", f"Host: {self.box.host}", f"User-Agent: {self.box.user_agent}"]
+        lines += [f"{k}: {v.format(mac=self.box.mac)}" for k, v in p.extra_headers]
+        lines += [f"{k}: {v}" for k, v in (headers or {}).items()]
+        if body:
+            lines.append(f"Content-Length: {len(body)}")
+        self.sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+        if body:
+            self.sock.sendall(body)
+        return self._response()
+
+    def _response(self):
+        while b"\r\n\r\n" not in self._buf:
+            self._recv()
+        raw_head, self._buf = self._buf.split(b"\r\n\r\n", 1)
+        self.header_size = len(raw_head) + 4
+        lines = raw_head.decode(errors="replace").split("\r\n")
+        headers = dict(l.split(": ", 1) for l in lines[1:] if ": " in l)
+        length = int(headers.get("Content-Length", 0))
+        while len(self._buf) < length:
+            self._recv()
+        body, self._buf = self._buf[:length], self._buf[length:]
+        return int(lines[0].split()[1]), headers, body
+
+    def _recv(self):
+        chunk = self.sock.recv(65536)
+        if not chunk:
+            raise ConnectionError("server closed the connection")
+        self._buf += chunk
+
+    def finish(self, ending, timeout=5):
+        """Ends the connection like the firmware does (see BoxProfile.endings). Returns once the server has
+        closed its side too."""
+        self.sock.settimeout(timeout)
+        if ending == "close_notify":
+            raw = self.sock.unwrap()  # raises unless the server answers with its close_notify
+        else:
+            self.sock.shutdown(socket.SHUT_WR)  # a plain FIN: SSLSocket.shutdown drops the TLS layer first
+            raw = self.sock
+        while raw.recv(4096):
+            pass
+        raw.close()
+
+    def close(self):
+        self.sock.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
 
 class SseListener:

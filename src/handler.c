@@ -1,3 +1,4 @@
+#include "error_text.h"
 #include "handler.h"
 #include "toniesJson.h"
 #include "server_helpers.h"
@@ -5,6 +6,26 @@
 #include "mutex_manager.h"
 #include "cJSON.h"
 #include "mqtt_server.h"
+
+#define TIME_DIGITS_MAX 11
+#define TIME_MIN_VALID 1600000000ULL /* 2020-09-13, an earlier time is no real one */
+
+static bool isValidTime(const char *text)
+{
+    size_t length = osStrlen(text);
+    if (length == 0 || length > TIME_DIGITS_MAX)
+    {
+        return false;
+    }
+    for (size_t i = 0; i < length; i++)
+    {
+        if (!osIsdigit(text[i]))
+        {
+            return false;
+        }
+    }
+    return strtoull(text, NULL, 10) >= TIME_MIN_VALID;
+}
 
 /* Streams a "name: value\r\n" header line without buffering it into a fixed
    stack buffer, so an arbitrarily long header/value from an upstream response
@@ -266,7 +287,7 @@ void cbrCloudHeaderPassthrough(void *src_ctx, HttpClientContext *cloud_ctx, cons
     {
         if (ctx->client_ctx->settings->internal.overlayNumber == 0)
         {
-            char_t *allowOrigin = ctx->connection->serverContext->settings.allowOrigin;
+            const char_t *allowOrigin = httpExtAllowOrigin();
             if (allowOrigin != NULL && osStrlen(allowOrigin) > 0)
             {
                 httpSendHeaderLine(ctx->connection, "Access-Control-Allow-Origin", allowOrigin);
@@ -275,6 +296,7 @@ void cbrCloudHeaderPassthrough(void *src_ctx, HttpClientContext *cloud_ctx, cons
     }
     switch (ctx->api)
     {
+    case V1_TIME:
     case V1_FRESHNESS_CHECK:
     case V3_FRESHNESS_CHECK:
         if (!header || osStrcmp(header, "Content-Length") == 0) // Skip empty line at the and + contentlen
@@ -332,6 +354,33 @@ void cbrCloudBodyPassthrough(void *src_ctx, HttpClientContext *cloud_ctx, const 
     // TRACE_INFO(">> cbrCloudBodyPassthrough: %lu received\r\n", length);
     switch (ctx->api)
     {
+    case V1_TIME:
+        /* a CC3200 (3.4.0) that got "teddycloud" as time blinked red and switched off */
+        if (!ctx->buffer)
+        {
+            ctx->buffer = osAllocMem(TIME_DIGITS_MAX + 1);
+        }
+        if (ctx->bufferPos + length <= TIME_DIGITS_MAX)
+        {
+            osMemcpy(&ctx->buffer[ctx->bufferPos], payload, length);
+        }
+        ctx->bufferPos += length;
+        if (error != NO_ERROR)
+        {
+            ctx->buffer[MIN(ctx->bufferPos, TIME_DIGITS_MAX)] = '\0';
+            if (ctx->bufferPos > TIME_DIGITS_MAX || !isValidTime(ctx->buffer))
+            {
+                TRACE_WARNING(">> cloud sent no valid time, answering the local time\r\n");
+                osSprintf(ctx->buffer, "%" PRIuTIME, time(NULL));
+            }
+            char line[64];
+            osSnprintf(line, sizeof(line), "Content-Length: %" PRIuSIZE "\r\n\r\n", osStrlen(ctx->buffer));
+            httpSend(ctx->connection, line, osStrlen(line), HTTP_FLAG_DELAY);
+            httpSend(ctx->connection, ctx->buffer, osStrlen(ctx->buffer), HTTP_FLAG_DELAY);
+            osFreeMem(ctx->buffer);
+            ctx->buffer = NULL;
+        }
+        break;
     case V2_CONTENT: // Also handles V1_CONTENT
         if (ctx->client_ctx->settings->cloud.cacheContent && httpClientContext->statusCode == 200)
         {
@@ -692,7 +741,7 @@ bool_t isValidTaf(const char *contentPath, bool checkHashAndSize)
         fsReadFile(file, headerBuffer, 4, &read_length);
         if (read_length == 4)
         {
-            uint32_t protobufSize = (uint32_t)((headerBuffer[0] << 24) | (headerBuffer[1] << 16) | (headerBuffer[2] << 8) | headerBuffer[3]);
+            uint32_t protobufSize = ((uint32_t)headerBuffer[0] << 24) | ((uint32_t)headerBuffer[1] << 16) | ((uint32_t)headerBuffer[2] << 8) | headerBuffer[3];
             if (protobufSize <= TAF_HEADER_SIZE)
             {
                 fsReadFile(file, headerBuffer, protobufSize, &read_length);
@@ -755,6 +804,7 @@ void readTrackPositions(tonie_info_t *tonieInfo, FsFile *file)
     track_positions_t *trackPos = &tonieInfo->additional.track_positions;
     TonieboxAudioFileHeader *tafHeader = tonieInfo->tafHeader;
     trackPos->count = tafHeader->n_track_page_nums;
+    trackPos->length = 0;
     if (trackPos->count > 0)
     {
         trackPos->pos = osAllocMem(trackPos->count * sizeof(uint32_t));
@@ -811,6 +861,22 @@ void readTrackPositions(tonie_info_t *tonieInfo, FsFile *file)
             if (i == 0)
             {
                 correction = granulePosition;
+            }
+        }
+        if (!hasError && tafHeader->num_bytes >= 4096)
+        {
+            /* the granule position of the last ogg page is the total length */
+            uint8_t buffer[14];
+            size_t readBytes = 0;
+            size_t filePos = 4096 + 4096 * ((tafHeader->num_bytes - 1) / 4096);
+            if (fsSeekFile(file, filePos, SEEK_SET) == NO_ERROR && fsReadFile(file, buffer, sizeof(buffer), &readBytes) == NO_ERROR && readBytes == sizeof(buffer) && osMemcmp(buffer, "OggS", 4) == 0)
+            {
+                uint64_t granulePosition = 0;
+                osMemcpy(&granulePosition, &buffer[6], 8);
+                if (granulePosition >= correction)
+                {
+                    trackPos->length = (uint32_t)((granulePosition - correction) / 48000);
+                }
             }
         }
         if (hasError)
@@ -900,7 +966,7 @@ tonie_info_t *getTonieInfoV2(const char *contentPath, bool lock, bool force_taf_
             fsReadFile(file, headerBuffer, 4, &read_length);
             if (read_length == 4)
             {
-                uint32_t protobufSize = (uint32_t)((headerBuffer[0] << 24) | (headerBuffer[1] << 16) | (headerBuffer[2] << 8) | headerBuffer[3]);
+                uint32_t protobufSize = ((uint32_t)headerBuffer[0] << 24) | ((uint32_t)headerBuffer[1] << 16) | ((uint32_t)headerBuffer[2] << 8) | headerBuffer[3];
                 if (protobufSize <= TAF_HEADER_SIZE)
                 {
                     fsReadFile(file, headerBuffer, protobufSize, &read_length);
@@ -993,6 +1059,7 @@ void freeTonieInfo(tonie_info_t *tonieInfo)
         osFreeMem(tonieInfo->additional.track_positions.pos);
         tonieInfo->additional.track_positions.pos = NULL;
         tonieInfo->additional.track_positions.count = 0;
+        tonieInfo->additional.track_positions.length = 0;
     }
 
     free_content_json(&tonieInfo->json);
@@ -1122,6 +1189,14 @@ char *getLibraryCachePath(settings_t *settings, uint32_t audioId, bool_t shortPa
     return libraryPath;
 }
 
+/* libraryPath (ending in ".taf") with the first 8 hex digits of the TAF's SHA1 added before the extension. */
+static char *libraryPathWithHash(const char *libraryPath, const TonieboxAudioFileHeader *tafHeader)
+{
+    const uint8_t *sha1 = tafHeader->sha1_hash.data;
+    size_t baseLen = osStrlen(libraryPath) - osStrlen(".taf");
+    return custom_asprintf("%.*s-%02x%02x%02x%02x.taf", (int)baseLen, libraryPath, sha1[0], sha1[1], sha1[2], sha1[3]);
+}
+
 error_t moveTAF2Lib(tonie_info_t *tonieInfo, settings_t *settings, bool_t rootDir)
 {
     error_t error = NO_ERROR;
@@ -1160,6 +1235,20 @@ error_t moveTAF2Lib(tonie_info_t *tonieInfo, settings_t *settings, bool_t rootDi
         if (libraryPath)
         {
             tonie_info_t *tonieInfoLib = getTonieInfo(libraryPath, false, settings);
+            if (tonieInfoLib->valid && osMemcmp(tonieInfoLib->tafHeader->sha1_hash.data, tonieInfo->tafHeader->sha1_hash.data, tonieInfoLib->tafHeader->sha1_hash.len))
+            {
+                /* The audio id is the time the audio was encoded, so different TAFs can share it.
+                   When that name holds other audio, this TAF goes next to it under a name that
+                   adds the start of its hash. */
+                char *suffixedPath = libraryPathWithHash(libraryPath, tonieInfo->tafHeader);
+                char *suffixedShortPath = libraryPathWithHash(libraryShortPath, tonieInfo->tafHeader);
+                osFreeMem(libraryPath);
+                osFreeMem(libraryShortPath);
+                libraryPath = suffixedPath;
+                libraryShortPath = suffixedShortPath;
+                freeTonieInfo(tonieInfoLib);
+                tonieInfoLib = getTonieInfo(libraryPath, false, settings);
+            }
             bool moveToLibrary = true;
             bool skipMove = false;
             if (tonieInfoLib->valid)
@@ -1246,7 +1335,7 @@ void cbrGenericHeaderPassthrough(void *src_ctx, HttpClientContext *cloud_ctx, co
     {
         if (ctx->client_ctx->settings->internal.overlayNumber == 0)
         {
-            char_t *allowOrigin = ctx->connection->serverContext->settings.allowOrigin;
+            const char_t *allowOrigin = httpExtAllowOrigin();
             if (allowOrigin != NULL && osStrlen(allowOrigin) > 0)
             {
                 httpSendHeaderLine(ctx->connection, "Access-Control-Allow-Origin", allowOrigin);
