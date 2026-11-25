@@ -58,7 +58,7 @@ static error_t tap_send_response_stream_with_size(HttpConnection *connection, co
     local_client_ctx.settings = &local_settings;
     connection->private.client_ctx = local_client_ctx;
 
-    error_t error = httpSendResponseStream(connection, uri, true);
+    error_t error = httpExtSendResponseStream(connection, uri, true);
 
     connection->private.client_ctx = saved_client_ctx;
     return error;
