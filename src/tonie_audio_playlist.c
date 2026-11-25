@@ -1138,7 +1138,7 @@ error_t tap_publish_taf_replace_safe(const char *tmp_taf, const char *final_taf)
                 {
                     error = ERROR_FAILURE;
                 }
-                TRACE_ERROR("Could not recover TAP final %s from backup %s, error=%d\r\n", final_taf, backup_taf, error);
+                TRACE_ERROR("Could not recover TAP final %s from backup %s, error=%s\r\n", final_taf, backup_taf, error2text(error));
                 osFreeMem(backup_taf);
                 return error;
             }
@@ -1156,7 +1156,7 @@ error_t tap_publish_taf_replace_safe(const char *tmp_taf, const char *final_taf)
             {
                 error = ERROR_FAILURE;
             }
-            TRACE_ERROR("Could not publish TAP %s from %s, error=%d\r\n", final_taf, tmp_taf, error);
+            TRACE_ERROR("Could not publish TAP %s from %s, error=%s\r\n", final_taf, tmp_taf, error2text(error));
         }
         osFreeMem(backup_taf);
         return error;
@@ -1170,7 +1170,7 @@ error_t tap_publish_taf_replace_safe(const char *tmp_taf, const char *final_taf)
         {
             error = ERROR_FAILURE;
         }
-        TRACE_ERROR("Could not backup TAP final %s to %s, error=%d\r\n", final_taf, backup_taf, error);
+        TRACE_ERROR("Could not backup TAP final %s to %s, error=%s\r\n", final_taf, backup_taf, error2text(error));
         osFreeMem(backup_taf);
         return error;
     }
@@ -1187,7 +1187,7 @@ error_t tap_publish_taf_replace_safe(const char *tmp_taf, const char *final_taf)
 
     if (error != NO_ERROR)
     {
-        TRACE_ERROR("Could not replace TAP final %s from %s, error=%d\r\n", final_taf, tmp_taf, error);
+        TRACE_ERROR("Could not replace TAP final %s from %s, error=%s\r\n", final_taf, tmp_taf, error2text(error));
         error_t rollback_error = fsRenameFile(backup_taf, final_taf);
         if (rollback_error != NO_ERROR || !fsFileExists(final_taf))
         {
@@ -1195,7 +1195,7 @@ error_t tap_publish_taf_replace_safe(const char *tmp_taf, const char *final_taf)
             {
                 rollback_error = ERROR_FAILURE;
             }
-            TRACE_ERROR("Could not restore TAP final %s from backup %s, error=%d\r\n", final_taf, backup_taf, rollback_error);
+            TRACE_ERROR("Could not restore TAP final %s from backup %s, error=%s\r\n", final_taf, backup_taf, error2text(rollback_error));
         }
     }
     else if (fsFileExists(backup_taf))
