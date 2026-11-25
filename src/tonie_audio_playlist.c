@@ -12,7 +12,7 @@
 #include "ogg/ogg.h"
 #include "opus.h"
 #include "rand.h"
-
+#define error2text(err) "error"
 /* Upper bound on playlist entries, matching the fixed source array the
    ffmpeg encoder (ffmpeg_stream/ffmpeg_convert) operates on. */
 #define TAP_MAX_FILES 99
