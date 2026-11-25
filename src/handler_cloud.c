@@ -883,7 +883,7 @@ error_t handleCloudContentExt(HttpConnection *connection, const char_t *uri, con
             {
                 TRACE_INFO("Serve finalized TAP TAF directly from %s after TAP lock timeout\r\n", tap_param.tap->_filepath_resolved);
                 char *finalFileRel = &tap_param.tap->_filepath_resolved[osStrlen(client_ctx->settings->internal.datadirfull)];
-                error_t response_error = httpSendResponseStream(connection, finalFileRel, false);
+                error_t response_error = httpExtSendResponseStream(connection, finalFileRel, false);
                 freeTonieInfo(tonieInfo);
                 return response_error;
             }
@@ -899,7 +899,7 @@ error_t handleCloudContentExt(HttpConnection *connection, const char_t *uri, con
             char *finalFileRel = &tap_param.tap->_filepath_resolved[osStrlen(client_ctx->settings->internal.datadirfull)];
             tap_target_unlock(tap_param.tap->_filepath_resolved);
             tap_target_locked = FALSE;
-            error_t response_error = httpSendResponseStream(connection, finalFileRel, false);
+            error_t response_error = httpExtSendResponseStream(connection, finalFileRel, false);
             if (response_error)
             {
                 if (response_error == ERROR_WRITE_FAILED)
@@ -1007,7 +1007,7 @@ error_t handleCloudContentExt(HttpConnection *connection, const char_t *uri, con
             }
             else
             {
-                response_error = httpSendResponseStream(connection, streamFileRel, true);
+                response_error = httpExtSendResponseStream(connection, streamFileRel, true);
             }
             TRACE_VERBOSE("TAP live response finished: error=%s predicted_taf_size=%" PRIu32 " active=%u quit=%u current=%u\r\n",
                           error2text(response_error), predicted_taf_size, tap_param.generator_active, tap_param.generator_done, stream_ctx->generation == stream_generation);
