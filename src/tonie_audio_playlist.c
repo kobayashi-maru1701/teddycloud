@@ -39,7 +39,7 @@ static error_t tap_random_u32(uint32_t *value)
         return ERROR_FAILURE;
     }
 
-    return rand_get_algo()->read(rand_get_context(), (uint8_t *)value, sizeof(*value));
+    return rand_get_algo()->generate(rand_get_context(), (uint8_t *)value, sizeof(*value));
 }
 
 bool_t tap_final_cache_is_current(tonie_audio_playlist_t *tap)
