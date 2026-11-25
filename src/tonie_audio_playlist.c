@@ -17,7 +17,7 @@
    ffmpeg encoder (ffmpeg_stream/ffmpeg_convert) operates on. */
 #define TAP_MAX_FILES 99
 
-bool_t is_valid_tap_file(char *filename)
+/* bool_t is_valid_tap_file(char *filename) */
 #define TAP_REMUX_MAX_PACKET_SIZE (TONIEFILE_FRAME_SIZE * 2)
 #define TAP_REMUX_MAX_PENDING_PACKETS 16
 #define TAP_REMUX_OPUS_HEAD_OFFSET 0x200
